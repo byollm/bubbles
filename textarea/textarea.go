@@ -1244,6 +1244,11 @@ func (m Model) LineInfo() LineInfo {
 // repositionView repositions the view of the viewport based on the defined
 // scrolling behavior.
 func (m *Model) repositionView() {
+	// Scroll against the buffer as it is now, not as the last View painted
+	// it: a SetValue of more rows than the height followed by SetHeight
+	// otherwise clamps the scroll to the previous frame's line count and
+	// leaves the cursor off-screen until the next Update.
+	m.syncViewport(false)
 	minimum := m.viewport.YOffset()
 	maximum := minimum + m.viewport.Height() - 1
 	if row := m.cursorLineNumber(); row < minimum {
@@ -1507,10 +1512,10 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	m.recalculateHeight()
 
-	// Give the viewport the buffer's row count before updating it, so that
-	// scrolling and clamping see the content that the next View will paint.
-	// The rows themselves are not rendered here: View renders the window.
-	m.syncViewport(false)
+	// The viewport's own Update only scrolls on mouse-wheel messages, which
+	// do not edit, so the row count it already holds from the last View is
+	// current; repositionView below re-syncs it before scrolling to the
+	// cursor, and View renders the window.
 	vp, cmd := m.viewport.Update(msg)
 	m.viewport = &vp
 	cmds = append(cmds, cmd)

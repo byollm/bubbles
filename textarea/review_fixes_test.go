@@ -152,3 +152,39 @@ func TestWordLeftAtBufferStartReturns(t *testing.T) {
 		t.Fatalf("second alt+left: column %d, want 0", m.Column())
 	}
 }
+
+// TestSetHeightAfterSetValueKeepsCursorVisible: a direct SetValue of more
+// rows than the height, then SetHeight, with no Update in between (a
+// restored draft, a model switch, a re-focus after blur). repositionView
+// used to scroll against the viewport's line count from the last View, so
+// the scroll clamped short and the cursor sat below the window until the
+// next keystroke.
+func TestSetHeightAfterSetValueKeepsCursorVisible(t *testing.T) {
+	for _, dynamic := range []bool{true, false} {
+		m := New()
+		m.MaxHeight = 0
+		m.DynamicHeight = dynamic
+		m.SetWidth(60)
+		m.SetHeight(8)
+		m.Focus()
+		m, _ = m.Update(nil)
+		_ = m.View()
+
+		lines := make([]string, 24)
+		for i := range lines {
+			lines[i] = "line"
+		}
+		m.SetValue(strings.Join(lines, "\n"))
+		m.SetHeight(8)
+
+		row := m.cursorLineNumber()
+		top, bottom := m.viewport.YOffset(), m.viewport.YOffset()+m.viewport.Height()-1
+		if row < top || row > bottom {
+			t.Fatalf("dynamic=%v: cursor row %d outside visible rows [%d,%d] after SetValue + SetHeight", dynamic, row, top, bottom)
+		}
+		view := m.View()
+		if !strings.Contains(view, "24 ") {
+			t.Fatalf("dynamic=%v: View does not show the cursor line:\n%s", dynamic, view)
+		}
+	}
+}
