@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -224,9 +223,6 @@ func TestViewMatchesOracle(t *testing.T) {
 				// Random edits through Update.
 				for i := range 60 {
 					k := corpusKeys[rng.Intn(len(corpusKeys))]
-					if k.Code == tea.KeyLeft && k.Mod == tea.ModAlt && !hasWordBefore(m) {
-						continue
-					}
 					m, _ = m.Update(k)
 					checkView(t, m, step(fmt.Sprintf("edit %d key %v", i, k)))
 					if i%17 == 16 {
@@ -296,23 +292,4 @@ func TestRowTree(t *testing.T) {
 			}
 		}
 	}
-}
-
-// hasWordBefore reports whether a non-space rune precedes the cursor. v2.1.0's
-// wordLeft never returns when there is none (alt+left at the start of an empty
-// buffer spins), which is upstream behaviour this change does not touch, so
-// the corpus avoids that key in that state.
-func hasWordBefore(m Model) bool {
-	for r := 0; r <= m.row && r < len(m.value); r++ {
-		end := len(m.value[r])
-		if r == m.row {
-			end = min(m.col, end)
-		}
-		for _, c := range m.value[r][:end] {
-			if !unicode.IsSpace(c) {
-				return true
-			}
-		}
-	}
-	return false
 }

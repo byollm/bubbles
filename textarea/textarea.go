@@ -481,6 +481,17 @@ func (m *Model) lineChanged(row int) {
 	rows := wrap(m.value[row], m.width)
 	m.rows.add(row, len(rows)-len(m.wrapped[row]))
 	m.wrapped[row] = rows
+	m.reserveLines()
+}
+
+// reserveLines grows the viewport content slice to hold every visual row of
+// the current buffer plus the end-of-buffer padding. It runs at every site
+// that changes the row count or the height, so View, which works on a copy
+// of the model and could not keep a bigger slice, never has to allocate one.
+func (m *Model) reserveLines() {
+	if n := m.rows.total() + m.height + 1; cap(m.lines) < n {
+		m.lines = make([]string, n)
+	}
 }
 
 // linesInserted makes room for n new logical lines at index at, wraps them
@@ -499,6 +510,7 @@ func (m *Model) linesInserted(at, n int) {
 		m.wrapped[i] = wrap(m.value[i], m.width)
 	}
 	m.rows.rebuild(m.wrapped)
+	m.reserveLines()
 }
 
 // linesRemoved drops the cache entries of the n logical lines that were
@@ -511,14 +523,21 @@ func (m *Model) linesRemoved(at, n int) {
 		m.rewrapAll()
 		return
 	}
+	// slices.Delete zeroes the vacated tail, so the removed lines' rows are
+	// not kept alive behind len.
 	m.wrapped = slices.Delete(m.wrapped, at, at+n)
 	m.rows.rebuild(m.wrapped)
+	m.reserveLines()
 }
 
 // rewrapAll rebuilds the wrap cache for every line: after a width change or
 // a Reset, when nothing in it can be reused.
 func (m *Model) rewrapAll() {
 	if cap(m.wrapped) >= len(m.value) {
+		// Drop the rows of lines that no longer exist before shrinking, or
+		// a Reset after a long message keeps every row of it reachable
+		// behind len until the slice grows over them again.
+		clear(m.wrapped[min(len(m.value), len(m.wrapped)):])
 		m.wrapped = m.wrapped[:len(m.value)]
 	} else {
 		m.wrapped = make([][][]rune, len(m.value))
@@ -527,6 +546,7 @@ func (m *Model) rewrapAll() {
 		m.wrapped[i] = wrap(l, m.width)
 	}
 	m.rows.rebuild(m.wrapped)
+	m.reserveLines()
 }
 
 // DefaultStyles returns the default styles for focused and blurred states for
@@ -1110,6 +1130,12 @@ func (m *Model) wordLeft() {
 		if m.col < len(m.value[m.row]) && !unicode.IsSpace(m.value[m.row][m.col]) {
 			break
 		}
+		if m.row == 0 && m.col == 0 {
+			// Start of the buffer with no word under the cursor: there is
+			// nothing further left to find, and characterLeft can no longer
+			// move, so without this the loop never ends.
+			break
+		}
 	}
 
 	for m.col > 0 {
@@ -1352,6 +1378,7 @@ func (m *Model) SetHeight(h int) {
 		m.height = max(h, minHeight)
 		m.viewport.SetHeight(max(h, minHeight))
 	}
+	m.reserveLines()
 
 	m.repositionView()
 }
@@ -1514,11 +1541,17 @@ func (m Model) isEmpty() bool {
 
 // viewLines returns the viewport's content slice sized to n entries, cleared.
 // The slice is reused across frames so that a frame allocates no more than
-// the rows it renders.
+// the rows it renders; reserveLines keeps it big enough at every mutation,
+// so the allocation below is only a safety net for a model that was never
+// reserved (it would be lost on a value-receiver View).
 func (m *Model) viewLines(n int) []string {
 	if cap(m.lines) >= n {
-		m.lines = m.lines[:n]
+		// Clear the rows the previous frame rendered beyond n as well, or a
+		// frame of a shrunken buffer keeps the old rendered rows reachable
+		// behind len.
+		m.lines = m.lines[:max(n, len(m.lines))]
 		clear(m.lines)
+		m.lines = m.lines[:n]
 		return m.lines
 	}
 	m.lines = make([]string, n)
@@ -1532,6 +1565,16 @@ func (m *Model) viewLines(n int) []string {
 // With render set, the rows inside the viewport window are rendered too;
 // Update leaves them empty because View renders the window it is about to
 // paint, at the offset the viewport has by then.
+//
+// Cost per call: rendering is O(rows in the window), but the full-length
+// slice the viewport contract requires still costs O(total rows) in the
+// clear above and in the viewport's own walk over every entry
+// (SetContentLines looks for newlines and measures the width of each line,
+// trivially for an empty string). That walk is a few nanoseconds per row
+// against microseconds per rendered row, so a keystroke is flat in practice
+// up to tens of thousands of rows, but it is not O(visible). Making it so
+// needs a viewport that takes a row count and a window renderer instead of
+// a slice.
 func (m *Model) syncViewport(render bool) {
 	if m.isEmpty() && m.row == 0 && m.col == 0 && m.Placeholder != "" {
 		m.viewport.SetContent(m.placeholderView())
