@@ -2035,12 +2035,158 @@ func Paste() tea.Msg {
 	return pasteMsg(str)
 }
 
+// widthCounter measures the display width of a string that grows by
+// appending, without rescanning what it already measured.
+//
+// Printable ASCII is the common case (a code composer is mostly ASCII), and
+// its display width is its byte count, so it is measured directly and costs
+// nothing. Anything else goes through uniseg, whose grapheme clusters can
+// merge across an append: a combining mark joins the character before it, a
+// ZWJ joins the emoji after it, a regional indicator pairs with the next
+// one. The counter therefore keeps the last cluster pending and re-measures
+// it together with the next chunk, so it reports the same width uniseg
+// reports for the whole string while doing O(chunk) work per append instead
+// of O(string).
+//
+// This is what makes wrap() linear: measuring the accumulated row from
+// scratch for every word made a keystroke on a long line quadratic, which
+// was 66% of the composer keystroke time on a 32k single-line paste.
+type widthCounter struct {
+	// nonASCII records that the text has left the printable-ASCII fast
+	// path, after which every append is measured with uniseg.
+	nonASCII bool
+	// asciiLen is the byte count of the printable-ASCII text measured so
+	// far, which is its display width while the text stays ASCII.
+	asciiLen int
+	// asciiLast is the last ASCII byte measured. It stays out of the
+	// settled width when the text turns non-ASCII, because the byte after
+	// it may still join it into one grapheme cluster.
+	asciiLast byte
+	// settled is the width of the clusters that can no longer change.
+	settled int
+	// pending is the last cluster, not yet counted in settled: the next
+	// append may still extend it.
+	pending string
+	// pendingWidth is the width of pending as measured in context, which is
+	// what the final answer needs.
+	pendingWidth int
+	// scratch holds pending + the new chunk while it is measured.
+	scratch []byte
+}
+
+// printableASCII reports whether s is entirely printable ASCII, whose
+// display width is its byte count.
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// toNonASCII leaves the printable-ASCII fast path. The ASCII measured so far
+// is a run of whole clusters, each one cell wide, so all but the last byte
+// become settled width; the last byte stays pending, because the byte that
+// follows it may still join it into one grapheme cluster.
+func (c *widthCounter) toNonASCII() {
+	c.nonASCII = true
+	if c.asciiLen > 0 {
+		c.settled = c.asciiLen - 1
+		c.pending = string(c.asciiLast)
+		c.pendingWidth = 1
+	}
+	c.asciiLen = 0
+}
+
+// add measures the width of s appended to the text measured so far.
+func (c *widthCounter) add(s string) {
+	if s == "" {
+		return
+	}
+	if !c.nonASCII {
+		if printableASCII(s) {
+			c.asciiLen += len(s)
+			c.asciiLast = s[len(s)-1]
+			return
+		}
+		c.toNonASCII()
+	}
+
+	c.scratch = append(c.scratch[:0], c.pending...)
+	c.scratch = append(c.scratch, s...)
+
+	rest := string(c.scratch)
+	state := -1
+	var last string
+	var lastWidth int
+	for len(rest) > 0 {
+		var cluster string
+		var w int
+		cluster, rest, w, state = uniseg.FirstGraphemeClusterInString(rest, state)
+		if rest == "" {
+			// The last cluster may still grow with the next append, so it
+			// stays pending rather than counted.
+			last = cluster
+			lastWidth = w
+			break
+		}
+		c.settled += w
+	}
+	c.pending = last
+	c.pendingWidth = lastWidth
+}
+
+// addRune measures one rune appended to the text measured so far.
+func (c *widthCounter) addRune(r rune) {
+	if !c.nonASCII {
+		if r >= 0x20 && r <= 0x7e {
+			c.asciiLen++
+			c.asciiLast = byte(r)
+			return
+		}
+		c.toNonASCII()
+	}
+	c.add(string(r))
+}
+
+// addRunes measures the runes appended to the text measured so far.
+func (c *widthCounter) addRunes(runes []rune) {
+	for _, r := range runes {
+		c.addRune(r)
+	}
+}
+
+// width is the display width of the text measured so far.
+func (c *widthCounter) width() int {
+	if !c.nonASCII {
+		return c.asciiLen
+	}
+	return c.settled + c.pendingWidth
+}
+
+// reset drops the measurement, for a new line.
+func (c *widthCounter) reset() {
+	c.nonASCII = false
+	c.asciiLen = 0
+	c.asciiLast = 0
+	c.settled = 0
+	c.pending = ""
+	c.pendingWidth = 0
+	c.scratch = c.scratch[:0]
+}
+
 func wrap(runes []rune, width int) [][]rune {
 	var (
 		lines  = [][]rune{{}}
 		word   = []rune{}
 		row    int
 		spaces int
+		// rowWidth measures the accumulated row, wordWidth the word being
+		// built. Both replace a full re-measurement of the text on every
+		// word, which made wrapping a long line quadratic.
+		rowWidth  widthCounter
+		wordWidth widthCounter
 	)
 
 	// Word wrap the runes
@@ -2049,40 +2195,45 @@ func wrap(runes []rune, width int) [][]rune {
 			spaces++
 		} else {
 			word = append(word, r)
+			wordWidth.addRune(r)
 		}
 
 		if spaces > 0 { //nolint:nestif
-			if uniseg.StringWidth(string(lines[row]))+uniseg.StringWidth(string(word))+spaces > width {
+			if rowWidth.width()+wordWidth.width()+spaces > width {
 				row++
 				lines = append(lines, []rune{})
-				lines[row] = append(lines[row], word...)
-				lines[row] = append(lines[row], repeatSpaces(spaces)...)
-				spaces = 0
-				word = nil
-			} else {
-				lines[row] = append(lines[row], word...)
-				lines[row] = append(lines[row], repeatSpaces(spaces)...)
-				spaces = 0
-				word = nil
+				rowWidth.reset()
 			}
+			lines[row] = append(lines[row], word...)
+			lines[row] = append(lines[row], repeatSpaces(spaces)...)
+			rowWidth.addRunes(word)
+			for i := 0; i < spaces; i++ {
+				rowWidth.addRune(' ')
+			}
+			spaces = 0
+			word = nil
+			wordWidth.reset()
 		} else {
 			// If the last character is a double-width rune, then we may not be able to add it to this line
 			// as it might cause us to go past the width.
 			lastCharLen := rw.RuneWidth(word[len(word)-1])
-			if uniseg.StringWidth(string(word))+lastCharLen > width {
+			if wordWidth.width()+lastCharLen > width {
 				// If the current line has any content, let's move to the next
 				// line because the current word fills up the entire line.
 				if len(lines[row]) > 0 {
 					row++
 					lines = append(lines, []rune{})
+					rowWidth.reset()
 				}
 				lines[row] = append(lines[row], word...)
+				rowWidth.addRunes(word)
 				word = nil
+				wordWidth.reset()
 			}
 		}
 	}
 
-	if uniseg.StringWidth(string(lines[row]))+uniseg.StringWidth(string(word))+spaces >= width {
+	if rowWidth.width()+wordWidth.width()+spaces >= width {
 		lines = append(lines, []rune{})
 		lines[row+1] = append(lines[row+1], word...)
 		// We add an extra space at the end of the line to account for the
